@@ -1,99 +1,134 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
+from pydantic import BaseModel
 from pyVim.connect import SmartConnect, Disconnect
 from pyVmomi import vim
 import ssl
-import json
+from pyVim.task import WaitForTask
 
 app = FastAPI()
+
+class VMCreationRequest(BaseModel):
+    vcenter_server: str
+    datacenter_name: str
+    cluster_name: str
+    datastore_name: str
+    template_name: str
+    vm_name: str
+    cpu: int
+    memory: int  # In GB
+    disk_size_gb: int
+    network_name: str
+    enable_cpu_hot_add: bool = False
+    enable_memory_hot_add: bool = False
 
 def get_ssl_context():
     context = ssl._create_unverified_context()
     return context
 
-def get_vm_details(vcenter):
+import json
+
+def load_vcenter_creds_for_server(vcenter_server: str):
+    try:
+        with open('creds.json', 'r') as file:
+            creds_list = json.load(file)
+            for creds in creds_list:
+                if creds['server'] == vcenter_server:
+                    return creds
+    except FileNotFoundError:
+        print("The creds.json file was not found.")
+    except json.JSONDecodeError:
+        print("Error decoding JSON from creds.json.")
+    
+    return None
+    
+
+def get_obj(content, vimtype, name):
+    """
+    Get the vsphere object associated with a given text name.
+    """
+    obj = None
+    container = content.viewManager.CreateContainerView(content.rootFolder, vimtype, True)
+    for c in container.view:
+        if c.name == name:
+            obj = c
+            break
+    container.Destroy()
+    return obj
+
+def find_network(content, network_name, datacenter):
+    """
+    Find a network by name within a specific datacenter.
+    """
+    networks = datacenter.networkFolder.childEntity
+    for network in networks:
+        if isinstance(network, vim.Network) and network.name == network_name:
+            return network
+    return None
+
+def create_vm_from_template(service_instance, vm_creation_request: VMCreationRequest):
+    content = service_instance.RetrieveContent()
+
+    # Objects have been found by get_obj and find_network functions
+    datacenter = get_obj(content, [vim.Datacenter], vm_creation_request.datacenter_name)
+    cluster = get_obj(content, [vim.ComputeResource], vm_creation_request.cluster_name)
+    datastore = get_obj(content, [vim.Datastore], vm_creation_request.datastore_name)
+    template_vm = get_obj(content, [vim.VirtualMachine], vm_creation_request.template_name)
+    network = find_network(content, vm_creation_request.network_name, datacenter)
+
+    # Create a clone specification
+    clone_spec = vim.vm.CloneSpec()
+
+    # Relocation spec
+    reloc_spec = vim.vm.RelocateSpec()
+    reloc_spec.datastore = datastore
+    reloc_spec.pool = cluster.resourcePool
+    clone_spec.location = reloc_spec
+
+    # Configuration spec (for customizing CPU, memory, etc.)
+    config_spec = vim.vm.ConfigSpec()
+    config_spec.numCPUs = vm_creation_request.cpu
+    config_spec.memoryMB = vm_creation_request.memory * 1024  # Convert GB to MB
+    config_spec.cpuHotAddEnabled = vm_creation_request.enable_cpu_hot_add
+    config_spec.memoryHotAddEnabled = vm_creation_request.enable_memory_hot_add
+    clone_spec.config = config_spec
+
+    # Network configuration
+    nic_spec = vim.vm.device.VirtualDeviceSpec()
+    nic_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
+    nic_spec.device = vim.vm.device.VirtualVmxnet3()
+    nic_spec.device.backing = vim.vm.device.VirtualEthernetCard.NetworkBackingInfo()
+    nic_spec.device.backing.network = network
+    nic_spec.device.backing.deviceName = network.name
+    nic_spec.device.connectable = vim.vm.device.VirtualDevice.ConnectInfo()
+    nic_spec.device.connectable.startConnected = True
+
+    # Add the network adapter to the clone spec
+    device_change = [nic_spec]
+    config_spec.deviceChange = device_change
+    clone_spec.config = config_spec
+
+    # Execute the clone task
+    clone_task = template_vm.Clone(folder=datacenter.vmFolder, name=vm_creation_request.vm_name, spec=clone_spec)
+
+    # Wait for the clone task to complete
+    WaitForTask(clone_task)
+
+    return {"vm_name": vm_creation_request.vm_name, "status": "VM creation completed"}
+
+@app.post("/create-vm/")
+async def create_vm_endpoint(vm_creation_request: VMCreationRequest):
+    vcenter_creds = load_vcenter_creds_for_server(vm_creation_request.vcenter_server)
     ssl_context = get_ssl_context()
     try:
-        service_instance = SmartConnect(host=vcenter['server'], user=vcenter['user'], pwd=vcenter['password'], sslContext=ssl_context)
-        content = service_instance.RetrieveContent()
-        container = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
-        vms = container.view
-        vm_details_list = []
-
-        for vm in vms:
-            vm_detail = {
-                'vm_name': vm.summary.config.name,
-                'networks': [],
-                'storage': [],
-                'datastores': [],
-                'ip_addresses': []
-            }
-            
-            # Network information
-            for net in vm.network:
-                if isinstance(net, vim.Network):
-                    vm_detail['networks'].append(net.name)
-
-            # Collecting all IP addresses
-            ip_addresses = []
-            for net_info in vm.guest.net:
-                if net_info.ipConfig is not None and net_info.ipConfig.ipAddress:
-                    for ip in net_info.ipConfig.ipAddress:
-                        ip_addresses.append(ip.ipAddress)
-            vm_detail['ip_addresses'] = ip_addresses
-
-            # Storage information (Virtual Disks)
-            for device in vm.config.hardware.device:
-                if isinstance(device, vim.vm.device.VirtualDisk):
-                    disk_detail = {
-                        'label': device.deviceInfo.label,
-                        'size_GB': device.capacityInKB / 1024 / 1024
-                    }
-                    vm_detail['storage'].append(disk_detail)
-
-            # Datastore information
-            for ds in vm.datastore:
-                vm_detail['datastores'].append(ds.name)
-
-            vm_details_list.append(vm_detail)
-
-        Disconnect(service_instance)
-        return vm_details_list
+        service_instance = SmartConnect(host=vcenter_creds['server'], user=vcenter_creds['user'], pwd=vcenter_creds['password'], sslContext=ssl_context)
     except Exception as e:
-        print(f"Failed to connect to vCenter {vcenter['server']} with error: {e}")
-        return []
+        raise HTTPException(status_code=500, detail=f"Failed to connect to vCenter: {str(e)}")
 
-def save_data_to_json(file_path, data):
-    with open(file_path, 'w') as file:
-        json.dump(data, file, indent=4)
+    try:
+        vm_creation_response = create_vm_from_template(service_instance, vm_creation_request)
+    except Exception as e:
+        Disconnect(service_instance)
+        raise HTTPException(status_code=500, detail=f"VM creation failed: {str(e)}")
 
-def load_data_from_json(file_path):
-    with open(file_path, 'r') as file:
-        return json.load(file)
-    
-@app.get("/capture-vm-details")
-async def capture_vm_details():
-    vcenters_json_file = 'creds.json'  # Update this path to your vCenters credentials file
-    output_json_file = 'vm_details.json'  # The output file where VM details will be saved
-    vcenters = json.load(open(vcenters_json_file))
-    all_vm_details = {}
-
-    for vcenter in vcenters:
-        vm_details = get_vm_details(vcenter)
-        all_vm_details[vcenter['server']] = vm_details
-
-    save_data_to_json(output_json_file, all_vm_details)
-    return {"message": "VM details captured successfully", "data": all_vm_details}
-
-@app.get("/find-vcenter/{vm_name}")
-async def find_vcenter(vm_name: str):
-    output_json_file = 'vm_details.json'  # Specify the path to your JSON file
-    all_vms = load_data_from_json(output_json_file)
-    
-    vm_name_lower = vm_name.lower()  # Convert the input VM name to lowercase
-    for vcenter, vms in all_vms.items():
-        for vm in vms:
-            if vm['vm_name'].lower() == vm_name_lower:  # Compare lowercased versions
-                return vm
-    
-    raise HTTPException(status_code=404, detail="VM not found")
-
+    Disconnect(service_instance)
+    return vm_creation_response
