@@ -251,9 +251,9 @@ async def add_network_to_vm_endpoint(request: NetworkAdditionRequest):
 class NetworkRemovalRequest(BaseModel):
     vcenter_server: str
     vm_name: str
-    network_name: str  # Optional: Use if you want to remove a specific network adapter by its label
+    network_label: str  # Optional: Use if you want to remove a specific network adapter by its label
 
-def remove_network_from_vm(service_instance, vm_name: str, network_name: str):
+def remove_network_from_vm(service_instance, vm_name: str, network_label: str):
     content = service_instance.RetrieveContent()
     vm = find_vm_by_name(service_instance, vm_name)
     if not vm:
@@ -261,7 +261,8 @@ def remove_network_from_vm(service_instance, vm_name: str, network_name: str):
 
     # Find the network adapter to remove
     for device in vm.config.hardware.device:
-        if isinstance(device, vim.vm.device.VirtualEthernetCard) and device.deviceInfo.summary == network_name:
+        print(device.deviceInfo)
+        if isinstance(device, vim.vm.device.VirtualEthernetCard) and device.deviceInfo.label == network_label:
             nic_key = device.key
             break
     else:
@@ -292,7 +293,7 @@ async def remove_network_from_vm_endpoint(request: NetworkRemovalRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to connect to vCenter: {str(e)}")
 
-    remove_network_status = remove_network_from_vm(service_instance, request.vm_name, request.network_name)
+    remove_network_status = remove_network_from_vm(service_instance, request.vm_name, request.network_label)
 
     Disconnect(service_instance)
     
@@ -301,3 +302,137 @@ async def remove_network_from_vm_endpoint(request: NetworkRemovalRequest):
     
     return {"detail": remove_network_status}
 
+
+
+########
+# Add disk to VM
+class DiskAdditionRequest(BaseModel):
+    vcenter_server: str
+    vm_name: str
+    disk_size_gb: int
+    datastore_name: str
+
+def find_datastore(service_instance, datastore_name):
+    content = service_instance.RetrieveContent()
+    for datacenter in content.rootFolder.childEntity:
+        if hasattr(datacenter, 'datastoreFolder'):
+            datastore_folder = datacenter.datastoreFolder
+            for datastore in datastore_folder.childEntity:
+                if datastore.name == datastore_name:
+                    return datastore
+    return None
+
+
+def add_disk_to_vm(service_instance, vm_name: str, disk_size_gb: int, datastore_name: str):
+    content = service_instance.RetrieveContent()
+    vm = find_vm_by_name(service_instance, vm_name)
+    if not vm:
+        return "VM not found"
+
+    datastore = find_datastore(service_instance, datastore_name)
+    if not datastore:
+        return "Datastore not found"
+
+    # Create a new virtual disk
+    spec = vim.vm.ConfigSpec()
+    unit_number = 0
+    for dev in vm.config.hardware.device:
+        if hasattr(dev.backing, 'fileName'):
+            unit_number = max(unit_number, int(dev.unitNumber) + 1)
+            if unit_number == 7:  # SCSI controller reserved
+                unit_number += 1
+
+    dev_changes = []
+    new_disk_kb = disk_size_gb * 1024 * 1024
+    disk_spec = vim.vm.device.VirtualDeviceSpec()
+    disk_spec.fileOperation = "create"
+    disk_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
+    disk_spec.device = vim.vm.device.VirtualDisk()
+    disk_spec.device.backing = vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
+    disk_spec.device.backing.diskMode = 'persistent'
+    disk_spec.device.backing.datastore = datastore
+    disk_spec.device.unitNumber = unit_number
+    disk_spec.device.capacityInKB = new_disk_kb
+    disk_spec.device.controllerKey = 1000  # Typically SCSI controller key
+    dev_changes.append(disk_spec)
+    spec.deviceChange = dev_changes
+
+    # Add the disk to the VM
+    task = vm.ReconfigVM_Task(spec=spec)
+    WaitForTask(task)
+    return "Disk added successfully"
+
+@app.post("/add-disk-to-vm/")
+async def add_disk_to_vm_endpoint(request: DiskAdditionRequest):
+    vcenter_creds = load_vcenter_creds_for_server(request.vcenter_server)
+    if not vcenter_creds:
+        raise HTTPException(status_code=404, detail="vCenter credentials not found")
+    ssl_context = get_ssl_context()
+    try:
+        service_instance = SmartConnect(host=vcenter_creds['server'], user=vcenter_creds['user'], pwd=vcenter_creds['password'],sslContext=ssl_context)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to connect to vCenter: {str(e)}")
+
+    add_disk_status = add_disk_to_vm(service_instance, request.vm_name, request.disk_size_gb, request.datastore_name)
+
+    Disconnect(service_instance)
+    
+    if add_disk_status != "Disk added successfully":
+        raise HTTPException(status_code=400, detail=add_disk_status)
+    
+    return {"detail": add_disk_status}
+
+
+########
+# Remove disk from VM
+class DiskRemovalRequest(BaseModel):
+    vcenter_server: str
+    vm_name: str
+    disk_label: str
+
+def remove_disk_from_vm(service_instance, vm_name: str, disk_label: str):
+    content = service_instance.RetrieveContent()
+    vm = find_vm_by_name(service_instance, vm_name)
+    if not vm:
+        return "VM not found"
+
+    # Find the disk to remove
+    for device in vm.config.hardware.device:
+        if isinstance(device, vim.vm.device.VirtualDisk) and device.deviceInfo.label == disk_label:
+            disk_key = device.key
+            break
+    else:
+        return "Disk not found"
+
+    # Create a device spec to remove the disk
+    virtual_device_spec = vim.vm.device.VirtualDeviceSpec()
+    virtual_device_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.remove
+    virtual_device_spec.device = vim.vm.device.VirtualDisk(key=disk_key)
+
+    # Create a VM config spec and assign the device change
+    config_spec = vim.vm.ConfigSpec(deviceChange=[virtual_device_spec])
+
+    # Reconfigure the VM
+    task = vm.ReconfigVM_Task(spec=config_spec)
+    WaitForTask(task)
+    return "Disk removed successfully"
+
+@app.post("/remove-disk-from-vm/")
+async def remove_disk_from_vm_endpoint(request: DiskRemovalRequest):
+    vcenter_creds = load_vcenter_creds_for_server(request.vcenter_server)
+    if not vcenter_creds:
+        raise HTTPException(status_code=404, detail="vCenter credentials not found")
+    ssl_context = get_ssl_context()
+    try:
+        service_instance = SmartConnect(host=vcenter_creds['server'], user=vcenter_creds['user'], pwd=vcenter_creds['password'],sslContext=ssl_context)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to connect to vCenter: {str(e)}")
+
+    remove_disk_status = remove_disk_from_vm(service_instance, request.vm_name, request.disk_label)
+
+    Disconnect(service_instance)
+    
+    if remove_disk_status != "Disk removed successfully":
+        raise HTTPException(status_code=400, detail=remove_disk_status)
+    
+    return {"detail": remove_disk_status}
