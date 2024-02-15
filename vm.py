@@ -180,3 +180,124 @@ async def delete_vm_endpoint(request: VMDeleteRequest):
         raise HTTPException(status_code=400, detail=delete_status)
     
     return {"detail": delete_status}
+
+
+####################
+# Add network to VM
+
+class NetworkAdditionRequest(BaseModel):
+    vcenter_server: str
+    vm_name: str
+    network_name: str
+
+def find_network(content, network_name):
+    for datacenter in content.rootFolder.childEntity:
+        if not hasattr(datacenter, 'networkFolder'):
+            continue
+        network_folder = datacenter.networkFolder
+        networks = [net for net in network_folder.childEntity if net.name == network_name]
+        if networks:
+            return networks[0]  # Return the first matching network
+    return None
+
+def add_network_to_vm(service_instance, vm_name: str, network_name: str):
+    content = service_instance.RetrieveContent()
+    vm = find_vm_by_name(service_instance, vm_name)
+    if vm is None:
+        return "VM not found"
+
+    network = find_network(content, network_name)
+    if not network:
+        return "Network not found"
+
+    nic_spec = vim.vm.device.VirtualDeviceSpec()
+    nic_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
+    nic_spec.device = vim.vm.device.VirtualVmxnet3()
+    nic_spec.device.backing = vim.vm.device.VirtualEthernetCard.NetworkBackingInfo()
+    nic_spec.device.backing.network = network
+    nic_spec.device.backing.deviceName = network.name
+    nic_spec.device.connectable = vim.vm.device.VirtualDevice.ConnectInfo()
+    nic_spec.device.connectable.startConnected = True
+
+    spec = vim.vm.ConfigSpec(deviceChange=[nic_spec])
+    task = vm.ReconfigVM_Task(spec=spec)
+    WaitForTask(task)
+    return "Network adapter added successfully"
+
+@app.post("/add-network-to-vm/")
+async def add_network_to_vm_endpoint(request: NetworkAdditionRequest):
+    vcenter_creds = load_vcenter_creds_for_server(request.vcenter_server)
+    if not vcenter_creds:
+        raise HTTPException(status_code=404, detail="vCenter credentials not found")
+    ssl_context = get_ssl_context()
+    try:
+        service_instance = SmartConnect(host=vcenter_creds['server'], user=vcenter_creds['user'], pwd=vcenter_creds['password'],sslContext=ssl_context)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to connect to vCenter: {str(e)}")
+
+    add_network_status = add_network_to_vm(service_instance, request.vm_name, request.network_name)
+
+    Disconnect(service_instance)
+    
+    if add_network_status != "Network adapter added successfully":
+        raise HTTPException(status_code=400, detail=add_network_status)
+    
+    return {"detail": add_network_status}
+
+
+
+####################
+# Remove network from VM
+class NetworkRemovalRequest(BaseModel):
+    vcenter_server: str
+    vm_name: str
+    network_name: str  # Optional: Use if you want to remove a specific network adapter by its label
+
+def remove_network_from_vm(service_instance, vm_name: str, network_name: str):
+    content = service_instance.RetrieveContent()
+    vm = find_vm_by_name(service_instance, vm_name)
+    if not vm:
+        return "VM not found"
+
+    # Find the network adapter to remove
+    for device in vm.config.hardware.device:
+        if isinstance(device, vim.vm.device.VirtualEthernetCard) and device.deviceInfo.summary == network_name:
+            nic_key = device.key
+            break
+    else:
+        return "Network adapter not found"
+
+    # Create a device spec to remove the network adapter
+    virtual_device_spec = vim.vm.device.VirtualDeviceSpec()
+    virtual_device_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.remove
+    virtual_device_spec.device = vim.vm.device.VirtualEthernetCard(key=nic_key)
+
+    # Create a VM config spec and assign the device change
+    config_spec = vim.vm.ConfigSpec(deviceChange=[virtual_device_spec])
+
+    # Reconfigure the VM
+    task = vm.ReconfigVM_Task(spec=config_spec)
+    WaitForTask(task)
+    return "Network adapter removed successfully"
+
+
+@app.post("/remove-network-from-vm/")
+async def remove_network_from_vm_endpoint(request: NetworkRemovalRequest):
+    vcenter_creds = load_vcenter_creds_for_server(request.vcenter_server)
+    if not vcenter_creds:
+        raise HTTPException(status_code=404, detail="vCenter credentials not found")
+    ssl_context = get_ssl_context()
+    try:
+        service_instance = SmartConnect(host=vcenter_creds['server'], user=vcenter_creds['user'], pwd=vcenter_creds['password'],sslContext=ssl_context)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to connect to vCenter: {str(e)}")
+
+    remove_network_status = remove_network_from_vm(service_instance, request.vm_name, request.network_name)
+
+    Disconnect(service_instance)
+    
+    if remove_network_status != "Network adapter removed successfully":
+        raise HTTPException(status_code=400, detail=remove_network_status)
+    
+    return {"detail": remove_network_status}
+
