@@ -55,15 +55,16 @@ async def capture_vms():
     save_data_to_json(output_json_file, all_vms)
     return all_vms
 
-# Endpoint to find the vCenter of a given VM
+# Endpoint to find the vCenter of a given VM, case-insensitively
 @app.get("/find-vcenter/{vm_name}")
 async def find_vcenter(vm_name: str):
     output_json_file = 'vcenters.json'  # Specify the path to your JSON file
     all_vms = load_data_from_json(output_json_file)
     
+    vm_name_lower = vm_name.lower()  # Convert the input VM name to lowercase
     for vcenter, vms in all_vms.items():
         for vm in vms:
-            if vm['vm_name'] == vm_name:
+            if vm['vm_name'].lower() == vm_name_lower:  # Compare lowercased versions
                 return {"vm_name": vm_name, "vcenter": vcenter}
     
     raise HTTPException(status_code=404, detail="VM not found")
